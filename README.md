@@ -10,10 +10,16 @@ forwards everything untouched, and — later — watches the position-carrying
 requests Helix sends so it can issue its own goal queries and publish them to a
 viewer pane.
 
-**Status:** milestones 1–2 complete. The proxy is byte-for-byte transparent
+**Status:** milestones 1–4 complete. The proxy is byte-for-byte transparent
 (completions, diagnostics, goto-def all behave exactly as if talking to
-`lake serve` directly) with full process lifecycle handling. The snoop, goal
-querier, viewer socket, and TUI are present as live, unproduced seams.
+`lake serve` directly) with full lifecycle handling. The goal-view seams are now
+active: the snoop tracks session + cursor focus, the querier debounces and
+injects `plainGoal` / `plainTermGoal` through the shared Lean-stdin writer,
+their responses are consumed (never leaked to Helix) and folded into state along
+with teed diagnostics + progress, and a headless JSON-lines sink exposes that
+state. There's also a `--capture` instrumentation mode for measuring Helix's
+update cadence — see [docs/cadence-capture.md](docs/cadence-capture.md). The
+Unix socket and ratatui viewer remain dormant until milestone 5.
 
 ## Layout
 
@@ -77,6 +83,11 @@ language-servers = ["lean"]
   `~/.local/state/lean-helix-view/proxy.log`); `lake serve`'s stderr passes
   through to the proxy's stderr, where Helix captures it. Set `RUST_LOG=debug`
   for verbose tracing.
+- Optional flags: `--capture <path>` (record client cadence, JSON-lines),
+  `--goal-sink <path>` (write goal-state snapshots, JSON-lines),
+  `--debounce-ms <n>` (default 120), `--trigger <method>` (repeatable; overrides
+  the default position-request set). See
+  [docs/cadence-capture.md](docs/cadence-capture.md).
 
 After this, Helix should behave exactly as before — the proxy is invisible. The
 viewer (`lean-helix-view watch`) and its socket arrive in milestone 5.
@@ -85,9 +96,10 @@ viewer (`lean-helix-view watch`) and its socket arrive in milestone 5.
 
 1. ✅ Scaffold + transport codec, proven by a byte-equality transparency test.
 2. ✅ Real forwarder over `lake serve` + full lifecycle; the proxy is invisible.
-3. Instrument: log every client→server method during real editing; decide the
-   update model from observed cadence.
-4. Snoop + goal querier + injection light up the dormant seams (headless sink).
+3. ✅ Instrument (`--capture`): record every client→server method to JSON-lines
+   to measure cadence; decide the update model from data, not assumption.
+4. ✅ Snoop + goal querier + injection: focus tracking, debounce, supersession,
+   consume-injected-id (no leak), tee diagnostics/progress, headless `--goal-sink`.
 5. Socket + minimal viewer (goals), then expected-type, diagnostics, progress.
 6. Polish: debounce tuning, reconnect/replay, `fileProgress` gating,
    workspace-root-keyed socket discovery.

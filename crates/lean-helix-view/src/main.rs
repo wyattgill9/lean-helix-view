@@ -1,6 +1,7 @@
 //! `lean-helix-view`: a thin dispatcher over the proxy and the viewer.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use tracing_appender::non_blocking::WorkerGuard;
@@ -23,6 +24,19 @@ enum Command {
     /// Give the upstream command as trailing args after `--`, e.g.
     /// `lean-helix-view proxy -- lake serve`.
     Proxy {
+        /// Idle debounce before an injected goal query fires (milliseconds).
+        #[arg(long, default_value_t = 120)]
+        debounce_ms: u64,
+        /// Record a client→server cadence capture (JSON-lines) to this path.
+        #[arg(long, value_name = "PATH")]
+        capture: Option<PathBuf>,
+        /// Write goal-state snapshots (JSON-lines) to this path (headless sink).
+        #[arg(long, value_name = "PATH")]
+        goal_sink: Option<PathBuf>,
+        /// Override the explicit-position trigger set (repeatable). Bare names
+        /// are prefixed with `textDocument/`; omit entirely for the default set.
+        #[arg(long = "trigger", value_name = "METHOD")]
+        triggers: Vec<String>,
         #[arg(last = true, required = true, value_name = "UPSTREAM")]
         upstream: Vec<String>,
     },
@@ -47,7 +61,21 @@ fn main() -> std::io::Result<()> {
         .build()?;
     runtime.block_on(async move {
         match cli.command {
-            Command::Proxy { upstream } => lhv_proxy::run(upstream).await,
+            Command::Proxy {
+                debounce_ms,
+                capture,
+                goal_sink,
+                triggers,
+                upstream,
+            } => {
+                let config = lhv_proxy::Config {
+                    debounce: Duration::from_millis(debounce_ms),
+                    triggers,
+                    capture_path: capture,
+                    goal_sink_path: goal_sink,
+                };
+                lhv_proxy::run(upstream, config).await
+            }
             Command::Watch { socket } => lhv_viewer::run(socket).await,
         }
     })

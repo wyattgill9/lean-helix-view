@@ -1,9 +1,10 @@
 //! The goal querier: injects `$/lean/plainGoal` and `$/lean/plainTermGoal`
-//! into the Lean stream and tracks the ids it issues so their responses can be
-//! intercepted (and never leak to Helix).
+//! into the Lean stream (through the *shared* Lean-stdin writer) and tracks the
+//! ids it issues so their responses can be consumed and never leak to Helix.
 //!
-//! Live in v1 — the inject channel works and `request` is real — but **no
-//! producer calls it yet**. Milestone 4 attaches the snoop.
+//! Supersession is a monotonic **generation**: each `request` bumps it and tags
+//! both of its queries with it. A response whose generation is no longer the
+//! latest is consumed but dropped, so only the most recent focus renders.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,10 +17,9 @@ use tokio::sync::mpsc;
 
 use crate::state::StateHandle;
 
-/// Prefix on every injected id. The id is *also* tracked in [`InjectedIds`];
-/// interception is by exact match against that map, so the prefix is a
-/// convenience, not the security boundary — a stray client id sharing the
-/// prefix still can't be misrouted.
+/// Prefix on every injected id. Interception is by exact match against
+/// [`Outstanding`], so the prefix is a convenience (and the no-leak assertion's
+/// hook), not the security boundary — a stray client id can't be misrouted.
 pub const INJECT_PREFIX: &str = "lhv-q";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,88 +28,121 @@ pub enum QueryKind {
     PlainTermGoal,
 }
 
-/// What an outstanding injected id is waiting for, so its response can be
-/// interpreted (responses carry only `id` + `result`, never the method).
+impl QueryKind {
+    fn method(self) -> &'static str {
+        match self {
+            QueryKind::PlainGoal => "$/lean/plainGoal",
+            QueryKind::PlainTermGoal => "$/lean/plainTermGoal",
+        }
+    }
+
+    fn tag(self) -> &'static str {
+        match self {
+            QueryKind::PlainGoal => "g",
+            QueryKind::PlainTermGoal => "t",
+        }
+    }
+}
+
+/// What an outstanding injected id is waiting for. `generation` lets the router
+/// drop a response whose focus has been superseded.
 #[derive(Debug, Clone)]
 pub struct Pending {
     pub kind: QueryKind,
     pub doc: DocRef,
     pub position: Position,
+    pub generation: u64,
 }
 
-/// The outstanding-injected-id set, shared by the querier (inserts) and the
-/// S2C pump (matches + removes).
-pub type InjectedIds = Arc<Mutex<HashMap<String, Pending>>>;
+/// The outstanding-injected-id registry plus the focus generation counter.
+/// Shared (cheaply cloneable) between the querier (registers) and the S2C pump
+/// (matches, removes, checks staleness).
+#[derive(Clone, Default)]
+pub struct Outstanding {
+    map: Arc<Mutex<HashMap<String, Pending>>>,
+    generation: Arc<AtomicU64>,
+}
 
-/// Issues goal queries and registers their ids. Cloneable — every field is a
-/// shared handle.
+impl Outstanding {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Open a new focus generation (monotonic). Its value is, by construction,
+    /// the current "latest".
+    pub fn next_gen(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// The most recently opened generation.
+    pub fn latest(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
+    }
+
+    pub fn register(&self, id: String, pending: Pending) {
+        self.map.lock().unwrap().insert(id, pending);
+    }
+
+    pub fn take(&self, id: &str) -> Option<Pending> {
+        self.map.lock().unwrap().remove(id)
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.map.lock().unwrap().len()
+    }
+}
+
+/// Issues goal queries through the shared Lean-stdin sender and registers their
+/// ids. Cloneable; owned by the snoop task in the live system.
 #[derive(Clone)]
 pub struct Querier {
     to_lean: mpsc::Sender<Frame>,
-    injected: InjectedIds,
-    next: Arc<AtomicU64>,
+    outstanding: Outstanding,
 }
 
 impl Querier {
-    pub fn new(to_lean: mpsc::Sender<Frame>, injected: InjectedIds) -> Self {
-        Self {
-            to_lean,
-            injected,
-            next: Arc::new(AtomicU64::new(0)),
-        }
+    pub fn new(to_lean: mpsc::Sender<Frame>, outstanding: Outstanding) -> Self {
+        Self { to_lean, outstanding }
     }
 
-    /// Inject both goal queries for a position, returning the ids registered.
+    /// Inject both goal queries for a focus, returning the generation issued.
     ///
-    /// Best-effort: if the to-Lean channel is full we drop the query (a newer
-    /// one will supersede it) rather than block — the Helix↔Lean path is never
-    /// stalled by snooping.
-    pub fn request(&self, doc: DocRef, position: Position) -> Vec<String> {
-        let mut ids = Vec::with_capacity(2);
+    /// Best-effort: if the shared sink is full we drop (a newer focus will
+    /// supersede), never blocking the Helix↔Lean path.
+    pub fn request(&self, doc: DocRef, position: Position) -> u64 {
+        let generation = self.outstanding.next_gen();
         for kind in [QueryKind::PlainGoal, QueryKind::PlainTermGoal] {
-            let id = self.fresh_id();
-            let method = match kind {
-                QueryKind::PlainGoal => "$/lean/plainGoal",
-                QueryKind::PlainTermGoal => "$/lean/plainTermGoal",
-            };
+            let id = format!("{INJECT_PREFIX}{generation}{}", kind.tag());
             let body = json!({
                 "jsonrpc": "2.0",
                 "id": id,
-                "method": method,
+                "method": kind.method(),
                 "params": {
                     "textDocument": { "uri": doc.uri },
                     "position": { "line": position.line, "character": position.character },
                 },
             });
-
-            self.injected.lock().unwrap().insert(
+            self.outstanding.register(
                 id.clone(),
                 Pending {
                     kind,
                     doc: doc.clone(),
                     position,
+                    generation,
                 },
             );
-
             let frame = Frame::from_body(&serde_json::to_vec(&body).expect("query serializes"));
             if self.to_lean.try_send(frame).is_err() {
-                // Sink backed up: forget this id so a stale response isn't eaten.
-                self.injected.lock().unwrap().remove(&id);
-                continue;
+                self.outstanding.take(&id); // unregister so no stale response is eaten
             }
-            ids.push(id);
         }
-        ids
-    }
-
-    fn fresh_id(&self) -> String {
-        format!("{INJECT_PREFIX}{}", self.next.fetch_add(1, Ordering::Relaxed))
+        generation
     }
 }
 
-/// Fold a consumed injected response into the state store. Called from the S2C
-/// consume branch; dormant in v1 (the id map is empty). Best-effort — an
-/// unparseable or unexpected result is ignored.
+/// Fold a consumed injected response into the state store (the staleness check
+/// happens in the caller). Best-effort — an unexpected result is ignored.
 pub fn handle_injected_response(state: &StateHandle, pending: Pending, body: &[u8]) {
     let Ok(value) = serde_json::from_slice::<Value>(body) else {
         return;
@@ -166,25 +199,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_registers_two_ids_and_enqueues_two_frames() {
+    async fn request_bumps_gen_registers_two_ids_and_sends_two_frames() {
         let (tx, mut rx) = mpsc::channel(8);
-        let injected: InjectedIds = Arc::new(Mutex::new(HashMap::new()));
-        let q = Querier::new(tx, injected.clone());
+        let outstanding = Outstanding::new();
+        let querier = Querier::new(tx, outstanding.clone());
 
-        let ids = q.request(doc(), Position { line: 2, character: 3 });
-        assert_eq!(ids.len(), 2);
-        assert!(ids.iter().all(|i| i.starts_with(INJECT_PREFIX)));
-        assert_eq!(injected.lock().unwrap().len(), 2);
+        let generation = querier.request(doc(), Position { line: 2, character: 3 });
+        assert_eq!(generation, 1);
+        assert_eq!(outstanding.latest(), 1);
+        assert_eq!(outstanding.len(), 2);
 
-        let f1 = rx.recv().await.unwrap();
-        let f2 = rx.recv().await.unwrap();
         let bodies = format!(
             "{}{}",
-            String::from_utf8_lossy(f1.body()),
-            String::from_utf8_lossy(f2.body())
+            String::from_utf8_lossy(rx.recv().await.unwrap().body()),
+            String::from_utf8_lossy(rx.recv().await.unwrap().body())
         );
         assert!(bodies.contains("$/lean/plainGoal"));
         assert!(bodies.contains("$/lean/plainTermGoal"));
+        assert!(bodies.contains("lhv-q1g") && bodies.contains("lhv-q1t"));
+    }
+
+    #[test]
+    fn latest_generation_supersedes_earlier_ones() {
+        let outstanding = Outstanding::new();
+        let g1 = outstanding.next_gen();
+        let g2 = outstanding.next_gen();
+        assert_eq!((g1, g2), (1, 2));
+        assert_eq!(outstanding.latest(), 2);
+        assert!(g1 != outstanding.latest(), "gen 1 is stale once gen 2 opened");
     }
 
     #[test]
@@ -199,14 +241,14 @@ mod tests {
                     line: 0,
                     character: 0,
                 },
+                generation: 1,
             },
-            r#"{"jsonrpc":"2.0","id":"lhv-q0","result":{"goals":["⊢ True"],"rendered":"r"}}"#
+            r#"{"jsonrpc":"2.0","id":"lhv-q1g","result":{"goals":["⊢ True"],"rendered":"r"}}"#
                 .as_bytes(),
         );
-        let s = state.snapshot();
-        assert_eq!(s.goals, vec!["⊢ True".to_string()]);
-        assert!(s.in_tactic);
-        assert_eq!(s.rendered.as_deref(), Some("r"));
+        let snap = state.snapshot();
+        assert_eq!(snap.goals, vec!["⊢ True".to_string()]);
+        assert!(snap.in_tactic);
     }
 
     #[test]
@@ -221,11 +263,12 @@ mod tests {
                     line: 0,
                     character: 0,
                 },
+                generation: 1,
             },
-            br#"{"jsonrpc":"2.0","id":"lhv-q0","result":null}"#,
+            br#"{"jsonrpc":"2.0","id":"lhv-q1g","result":null}"#,
         );
-        let s = state.snapshot();
-        assert!(!s.in_tactic);
-        assert!(s.goals.is_empty());
+        let snap = state.snapshot();
+        assert!(!snap.in_tactic);
+        assert!(snap.goals.is_empty());
     }
 }
