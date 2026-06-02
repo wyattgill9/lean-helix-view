@@ -1,9 +1,11 @@
 //! Proxy entry point: own the `lake serve` child, wire stdio to the forwarder,
-//! and map every shutdown path so no orphaned Lean server is left behind.
+//! and map every shutdown path so no orphaned Lean server is left behind — and
+//! so a first-run failure (no `lake`, project not built, wrong toolchain) fails
+//! with a reason a human can act on.
 
 use std::io;
 use std::path::PathBuf;
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
 use tokio::io::BufReader;
@@ -34,8 +36,8 @@ pub struct Config {
     pub socket_path: Option<PathBuf>,
 }
 
-/// Run the proxy until Helix or Lean closes. `upstream` is the configurable
-/// command (e.g. `["lake", "serve"]`), taken from the binary's trailing args.
+/// Run the proxy until Helix or Lean closes (or a termination signal arrives).
+/// `upstream` is the configurable command (e.g. `["lake", "serve"]`).
 pub async fn run(upstream: Vec<String>, config: Config) -> io::Result<()> {
     let (program, args) = upstream
         .split_first()
@@ -47,9 +49,7 @@ pub async fn run(upstream: Vec<String>, config: Config) -> io::Result<()> {
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit()) // lake's stderr passes straight through to ours
         .spawn()
-        .map_err(|e| {
-            io::Error::new(e.kind(), format!("failed to spawn upstream {program:?}: {e}"))
-        })?;
+        .map_err(|e| io::Error::new(e.kind(), spawn_error_message(program, &e)))?;
     tracing::info!(%program, ?args, pid = ?child.id(), "spawned upstream Lean server");
 
     let lean_in = child.stdin.take().expect("child stdin is piped");
@@ -88,14 +88,29 @@ pub async fn run(upstream: Vec<String>, config: Config) -> io::Result<()> {
         Some(root_tx),
     );
 
-    match fwd.wait_first().await {
-        FirstClosed::Client => {
+    let first = tokio::select! {
+        outcome = fwd.wait_first() => Some(outcome),
+        _ = shutdown_signal() => None,
+    };
+
+    match first {
+        Some(FirstClosed::Client) => {
             tracing::info!("Helix closed; reaping upstream and draining");
             reap(&mut child).await;
             fwd.join_s2c().await;
         }
-        FirstClosed::Server => {
-            tracing::warn!("upstream closed first; tearing down so Helix sees its server died");
+        Some(FirstClosed::Server) => {
+            let status = reap(&mut child).await;
+            if fwd.server_spoke() {
+                tracing::warn!("upstream exited; Helix will see its server stop");
+            } else {
+                // Never produced any LSP output → it died during startup.
+                report_startup_failure(program, status);
+            }
+            fwd.abort_c2s();
+        }
+        None => {
+            tracing::info!("received termination signal; shutting down");
             fwd.abort_c2s();
             reap(&mut child).await;
         }
@@ -104,6 +119,37 @@ pub async fn run(upstream: Vec<String>, config: Config) -> io::Result<()> {
     fwd.drain_writers().await;
     tracing::info!("proxy exiting");
     Ok(())
+}
+
+/// A clear, specific reason a spawn failed — distinguishing "not found" (the
+/// most common first-run failure) from other errors.
+fn spawn_error_message(program: &str, e: &io::Error) -> String {
+    if e.kind() == io::ErrorKind::NotFound {
+        format!(
+            "upstream command `{program}` not found — is Lean/elan installed and `{program}` on your PATH?"
+        )
+    } else {
+        format!("failed to spawn upstream `{program}`: {e}")
+    }
+}
+
+/// The upstream spawned but exited without ever talking LSP: a startup failure.
+fn report_startup_failure(program: &str, status: Option<ExitStatus>) {
+    let detail = match status {
+        Some(s) => match s.code() {
+            Some(code) => format!("exited with code {code}"),
+            None => format!("was terminated ({s})"),
+        },
+        None => "did not exit cleanly".to_string(),
+    };
+    // stderr (which Helix captures) + the log — never stdout.
+    eprintln!(
+        "lean-helix-view: the upstream Lean server (`{program}`) {detail} without starting up.\n  \
+         Likely causes: not inside a Lean project, the project isn't built (run `lake build`), \
+         `{program}` is the wrong command, or the toolchain is missing.\n  \
+         Any output from `{program}` itself is above; details are in the log."
+    );
+    tracing::error!(%program, ?status, "upstream exited without starting up");
 }
 
 /// Spawn the viewer socket server. With an explicit `override_path` it binds at
@@ -137,15 +183,44 @@ fn spawn_socket_server(
 }
 
 /// Wait for the child to exit, killing it if it overstays the grace window —
-/// the guard against orphaned Lean servers pegging a core.
-async fn reap(child: &mut Child) {
+/// the guard against orphaned Lean servers pegging a core. Returns the exit
+/// status when the child exited on its own.
+async fn reap(child: &mut Child) -> Option<ExitStatus> {
     match timeout(REAP_GRACE, child.wait()).await {
-        Ok(Ok(status)) => tracing::info!(?status, "upstream exited"),
-        Ok(Err(e)) => tracing::warn!(error = %e, "error awaiting upstream"),
+        Ok(Ok(status)) => {
+            tracing::info!(?status, "upstream exited");
+            Some(status)
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "error awaiting upstream");
+            None
+        }
         Err(_) => {
             tracing::warn!("upstream did not exit within grace; killing");
             let _ = child.start_kill();
             let _ = child.wait().await;
+            None
         }
+    }
+}
+
+/// Resolve when a termination signal (SIGTERM / SIGINT) arrives, so we can shut
+/// down cleanly — reaping the child and dropping the socket task (which removes
+/// its socket file) — instead of being killed mid-flight.
+async fn shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = signal(SignalKind::terminate()).ok();
+    let mut interrupt = signal(SignalKind::interrupt()).ok();
+    match (term.as_mut(), interrupt.as_mut()) {
+        (Some(t), Some(i)) => {
+            tokio::select! { _ = t.recv() => {}, _ = i.recv() => {} }
+        }
+        (Some(t), None) => {
+            t.recv().await;
+        }
+        (None, Some(i)) => {
+            i.recv().await;
+        }
+        (None, None) => std::future::pending::<()>().await,
     }
 }

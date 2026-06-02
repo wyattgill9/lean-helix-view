@@ -10,7 +10,7 @@
 //! match by construction and there is no protocol negotiation.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -136,6 +136,31 @@ pub fn socket_path_for_root(root_path: &str) -> PathBuf {
     socket_dir().join(format!("{:016x}.sock", fnv1a64(root_path.as_bytes())))
 }
 
+/// Walk up from `start` to the first directory containing a Lean workspace
+/// marker (`lakefile.lean` / `lakefile.toml` / `lean-toolchain`). This lets the
+/// viewer find the same root the proxy keyed its socket on, even from a nested
+/// subdirectory.
+pub fn find_workspace_root(start: &Path) -> Option<PathBuf> {
+    const MARKERS: [&str; 3] = ["lakefile.lean", "lakefile.toml", "lean-toolchain"];
+    let mut dir = Some(start);
+    while let Some(d) = dir {
+        if MARKERS.iter().any(|m| d.join(m).exists()) {
+            return Some(d.to_path_buf());
+        }
+        dir = d.parent();
+    }
+    None
+}
+
+/// The viewer's default socket: resolve the workspace root by walking up from
+/// the current directory, canonicalize it, and key the socket off it (falling
+/// back to the current directory if no marker is found).
+pub fn workspace_socket_path() -> PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let root = find_workspace_root(&cwd).unwrap_or(cwd);
+    socket_path_for_root(&canonical(&root.to_string_lossy()))
+}
+
 /// Canonical filesystem path for a workspace, from an LSP `rootUri`. Falls back
 /// to the (decoded) literal when the path can't be canonicalized.
 pub fn root_path_from_uri(uri: &str) -> String {
@@ -224,5 +249,24 @@ mod tests {
     #[test]
     fn percent_decoding_in_root_uri() {
         assert_eq!(root_path_from_uri("file:///home/a%20b/p"), "/home/a b/p");
+    }
+
+    #[test]
+    fn find_workspace_root_walks_up_to_the_marker() {
+        let base = std::env::temp_dir().join(format!("lhv-root-{}", std::process::id()));
+        let nested = base.join("sub/deep");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(base.join("lakefile.toml"), b"").unwrap();
+
+        let found = find_workspace_root(&nested).expect("marker found by walking up");
+        assert_eq!(
+            std::fs::canonicalize(&found).unwrap(),
+            std::fs::canonicalize(&base).unwrap()
+        );
+
+        // No marker anywhere above a temp file → None.
+        let orphan = std::env::temp_dir();
+        let _ = orphan; // (temp_dir itself may or may not have markers; don't assert)
+        std::fs::remove_dir_all(&base).ok();
     }
 }

@@ -6,21 +6,30 @@ diagnostics state in a tmux/zellij pane next to the editor.
 
 It works by slipping a transparent LSP proxy between Helix and `lake serve`:
 Helix talks to the proxy as if it were the Lean language server, the proxy
-forwards everything untouched, and — later — watches the position-carrying
-requests Helix sends so it can issue its own goal queries and publish them to a
-viewer pane.
+forwards everything untouched, and watches the position-carrying requests Helix
+sends so it can issue its own goal queries and publish them to a viewer pane.
 
-**Status:** milestones 1–5 complete — it works end-to-end. The proxy is
-byte-for-byte transparent (completions, diagnostics, goto-def all behave exactly
-as if talking to `lake serve` directly) with full lifecycle handling. The snoop
-tracks session + cursor focus; the querier debounces and injects `plainGoal` /
-`plainTermGoal` through the shared Lean-stdin writer; their responses are
-consumed (never leaked to Helix) and folded into state with teed diagnostics +
-progress; and a Unix-socket server publishes that state to the `watch` ratatui
-viewer in an adjacent pane. The publish path is fully decoupled from the LSP
-pipe (a `watch` channel, drop-to-latest, never awaits a viewer). A `--capture`
-mode measures Helix's update cadence — see
-[docs/cadence-capture.md](docs/cadence-capture.md). Milestone 6 (polish) remains.
+**Status: v1.0.** The proxy is byte-for-byte transparent (completions,
+diagnostics, goto-def all behave exactly as if talking to `lake serve` directly)
+with full lifecycle handling. The snoop tracks session + cursor focus; the
+querier debounces and injects `plainGoal` / `plainTermGoal` through the shared
+Lean-stdin writer; their responses are consumed (never leaked to Helix) and
+folded into state with teed diagnostics + progress; and a Unix-socket server
+publishes that state to the `watch` ratatui viewer. The publish path is fully
+decoupled from the LSP pipe (a `watch` channel, drop-to-latest, never awaits a
+viewer).
+
+### How it updates — the one caveat
+
+The view refreshes whenever Helix sends a position-carrying request: on **edits,
+hover, completion, and goto-definition**, and on the idle requests Helix issues
+when the cursor comes to rest (typically `textDocument/documentHighlight` after
+`editor.idle-timeout`). It does **not** refresh on pure cursor motion while you
+are still moving — Helix exposes no cursor-move event to external tools, so this
+is a Helix design constraint, not a limitation we can fix from outside. In
+practice the goals update within a moment of the cursor settling. (You can
+measure your own Helix's cadence and tune the trigger set — see
+[docs/cadence-capture.md](docs/cadence-capture.md).)
 
 ## Layout
 
@@ -48,16 +57,25 @@ The forwarder upholds three invariants absolutely:
 3. **Never let snoop, viewer, or logging stall the path.** The viewer channel is
    `watch`-based (drop-to-latest, no backpressure); logging goes to a file.
 
-## Build
+## Install
+
+From a clone of this repository:
+
+```sh
+cargo install --path crates/lean-helix-view
+```
+
+That puts `lean-helix-view` on your `PATH` (`~/.cargo/bin`). Requires a Rust
+toolchain (edition 2024 / Rust ≥ 1.85) and, for use, a working Lean install
+(`lake` on your `PATH`, via [elan](https://github.com/leanprover/elan)).
+
+To build from source without installing:
 
 ```sh
 nix develop          # or: direnv allow  (provides cargo + elan)
-cargo build --release
+cargo build --release   # binary at target/release/lean-helix-view
 cargo test --workspace
 ```
-
-The release binary lands at `target/release/lean-helix-view`. Put it on your
-`PATH` (e.g. `cargo install --path crates/lean-helix-view`).
 
 ## Wiring into Helix
 
@@ -112,6 +130,31 @@ arrows) scroll goals, `g`/`Home` jump to top. It renders Goals, Expected type,
 Diagnostics, and a Progress (elaborating) indicator, with a connection-status
 line.
 
+## Troubleshooting
+
+The proxy logs to `$XDG_STATE_HOME/lean-helix-view/proxy.log` (default
+`~/.local/state/...`); `RUST_LOG=debug` adds detail. In Helix, the Lean server's
+stderr (and the proxy's diagnostics) show via `:log-open`.
+
+- **"The Lean server didn't start."** The proxy prints a specific reason to
+  stderr (which Helix captures):
+  - *`lake` not found* — install Lean via [elan](https://github.com/leanprover/elan)
+    and make sure `lake` is on the `PATH` Helix sees. Use an absolute `command`
+    in `languages.toml` if needed.
+  - *exited without starting up* — usually the project isn't built or you're not
+    in a Lean project. Run `lake build` in the project, then reopen.
+- **Viewer shows "No proxy found for this workspace."** Helix isn't running for
+  this project (no proxy bound its socket yet), or you launched `watch` from a
+  different directory than the project root. Run it from the project root, or
+  pass `--socket <path>` (the expected path is shown on that screen and in the
+  proxy log).
+- **Viewer shows "waiting / disconnected, retrying…"** Normal before the proxy
+  starts or across a restart; it reconnects with backoff. If it never connects,
+  check that the proxy is running (`:log-open` in Helix) and that the socket
+  paths match.
+- **A stale socket** from a crashed proxy is detected and reclaimed on the next
+  start — no action needed.
+
 ## Roadmap
 
 1. ✅ Scaffold + transport codec, proven by a byte-equality transparency test.
@@ -122,5 +165,11 @@ line.
    consume-injected-id (no leak), tee diagnostics/progress, headless `--goal-sink`.
 5. ✅ Socket server (rootUri-keyed, replay-on-connect, drop-to-latest) + the
    `watch` ratatui viewer: Goals / Expected type / Diagnostics / Progress.
-6. Polish: debounce tuning, robust reconnect/backoff, `fileProgress` goal-gating
-   (stale-goal dimming), multi-instance socket discovery.
+6. ✅ Release hardening: clear failure diagnostics, reconnect backoff, workspace
+   -root resolution, multi-instance sockets, stale-socket reclaim, cleanup on
+   every exit, progress goal-gating, docs + release metadata. **→ v1.0**
+
+### Not in v1 (future, not gaps)
+
+Lean's interactive RPC session (`$/lean/rpc/connect`), interactive widgets, the
+browser infoview, and goals-on-pure-cursor-motion (blocked by Helix regardless).

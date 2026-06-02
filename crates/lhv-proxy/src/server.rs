@@ -13,7 +13,7 @@
 //! [`StateHandle::update`]: crate::state::StateHandle::update
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use lhv_lsp::{Frame, write_frame};
 use lhv_wire::ServerMsg;
@@ -24,11 +24,10 @@ use crate::state::StateHandle;
 /// Bind `path` and accept viewer connections forever, one publisher task each.
 /// Removes the socket file on exit (when this future is dropped or errors).
 pub async fn serve(path: PathBuf, state: StateHandle) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        let _ = tokio::fs::create_dir_all(parent).await;
-    }
-    let _ = std::fs::remove_file(&path); // clear any stale socket
-    let listener = UnixListener::bind(&path)?;
+    let listener = match reclaim_and_bind(&path).await? {
+        Some(listener) => listener,
+        None => return Ok(()), // a live proxy already serves this workspace
+    };
     let _cleanup = SocketCleanup(path.clone());
     tracing::info!(path = %path.display(), "viewer socket listening");
 
@@ -58,6 +57,34 @@ async fn publish_to(mut stream: UnixStream, state: StateHandle) -> io::Result<()
         }
     }
     Ok(())
+}
+
+/// Bind the socket, reclaiming a *stale* file left by a crashed proxy. If the
+/// path is held by a **live** server (another proxy for this workspace), don't
+/// clobber it — return `None` so this instance simply runs without a viewer
+/// socket. Other bind errors propagate.
+async fn reclaim_and_bind(path: &Path) -> io::Result<Option<UnixListener>> {
+    if let Some(parent) = path.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+    match UnixListener::bind(path) {
+        Ok(listener) => Ok(Some(listener)),
+        Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
+            // Probe: a live server accepts a connection; a stale file refuses.
+            if UnixStream::connect(path).await.is_ok() {
+                tracing::warn!(
+                    path = %path.display(),
+                    "another proxy already serves this workspace; viewer socket not bound here"
+                );
+                Ok(None)
+            } else {
+                tracing::info!(path = %path.display(), "reclaiming stale socket");
+                let _ = std::fs::remove_file(path);
+                Ok(Some(UnixListener::bind(path)?))
+            }
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Removes the socket file when the server task is dropped or returns.
@@ -202,6 +229,50 @@ mod tests {
 
         server.abort();
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A leftover socket file from a crashed proxy is reclaimed on bind.
+    #[tokio::test]
+    async fn stale_socket_file_is_reclaimed() {
+        let path = unique_socket();
+        std::fs::write(&path, b"leftover").unwrap(); // simulate a crashed proxy's file
+        let bound = reclaim_and_bind(&path).await.unwrap();
+        assert!(bound.is_some(), "stale file must be reclaimed, not error out");
+        drop(bound);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A *live* server at the path is not clobbered.
+    #[tokio::test]
+    async fn live_socket_is_not_clobbered() {
+        let path = unique_socket();
+        let _live = reclaim_and_bind(&path).await.unwrap().expect("first bind");
+        let second = reclaim_and_bind(&path).await.unwrap();
+        assert!(second.is_none(), "must not clobber a live server");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Two workspaces → two distinct sockets → each viewer sees its own state.
+    #[tokio::test]
+    async fn two_roots_yield_independent_sockets() {
+        let (path_a, path_b) = (unique_socket(), unique_socket());
+        let state_a = StateHandle::new();
+        state_a.update(|s| s.goals = vec!["A".into()]);
+        let state_b = StateHandle::new();
+        state_b.update(|s| s.goals = vec!["B".into()]);
+
+        let sa = tokio::spawn(serve(path_a.clone(), state_a));
+        let sb = tokio::spawn(serve(path_b.clone(), state_b));
+
+        let mut ra = BufReader::new(connect_retry(&path_a).await);
+        let mut rb = BufReader::new(connect_retry(&path_b).await);
+        assert_eq!(read_snapshot(&mut ra).await.goals, vec!["A".to_string()]);
+        assert_eq!(read_snapshot(&mut rb).await.goals, vec!["B".to_string()]);
+
+        sa.abort();
+        sb.abort();
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
     }
 
     /// Two viewers both receive updates; and the producer is fine with none.

@@ -17,7 +17,7 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use lhv_lsp::read_frame;
-use lhv_wire::{Diagnostic, ServerMsg, Severity, Snapshot, cwd_root, socket_path_for_root};
+use lhv_wire::{Diagnostic, ServerMsg, Severity, Snapshot, workspace_socket_path};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -45,7 +45,7 @@ type Tui = Terminal<CrosstermBackend<Stdout>>;
 
 /// Run the viewer until the user quits.
 pub async fn run(socket: Option<PathBuf>) -> io::Result<()> {
-    let path = socket.unwrap_or_else(|| socket_path_for_root(&cwd_root()));
+    let path = socket.unwrap_or_else(workspace_socket_path);
 
     let state = Arc::new(Mutex::new(ViewerState {
         snapshot: Snapshot::default(),
@@ -88,9 +88,11 @@ pub async fn run(socket: Option<PathBuf>) -> io::Result<()> {
 }
 
 async fn network_loop(path: PathBuf, state: Arc<Mutex<ViewerState>>) {
+    let mut backoff: Option<Duration> = None;
     loop {
         match UnixStream::connect(&path).await {
             Ok(stream) => {
+                backoff = None; // reset on a successful connect
                 set_status(&state, Status::Connected);
                 let mut reader = BufReader::new(stream);
                 while let Ok(Some(frame)) = read_frame(&mut reader).await {
@@ -102,7 +104,19 @@ async fn network_loop(path: PathBuf, state: Arc<Mutex<ViewerState>>) {
             }
             Err(_) => set_status(&state, Status::Waiting),
         }
-        tokio::time::sleep(Duration::from_millis(500)).await; // reconnect backoff
+        let delay = next_backoff(backoff);
+        backoff = Some(delay);
+        tokio::time::sleep(delay).await; // bounded backoff, never a hot spin
+    }
+}
+
+/// Bounded exponential reconnect backoff: 250ms → 500ms → 1s → 2s, capped at 3s.
+fn next_backoff(current: Option<Duration>) -> Duration {
+    const MIN: Duration = Duration::from_millis(250);
+    const MAX: Duration = Duration::from_secs(3);
+    match current {
+        None => MIN,
+        Some(d) => (d * 2).min(MAX),
     }
 }
 
@@ -195,7 +209,7 @@ fn ui(frame: &mut ratatui::Frame, snap: &Snapshot, status: Status, scroll: u16, 
     .split(frame.area());
 
     render_status(frame, regions[0], snap, status, path);
-    render_goals(frame, regions[1], snap, scroll);
+    render_goals(frame, regions[1], snap, scroll, status, path);
     render_expected(frame, regions[2], snap);
     render_diagnostics(frame, regions[3], snap);
     render_progress(frame, regions[4], snap, tick);
@@ -226,7 +240,33 @@ fn render_status(frame: &mut ratatui::Frame, area: Rect, snap: &Snapshot, status
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn render_goals(frame: &mut ratatui::Frame, area: Rect, snap: &Snapshot, scroll: u16) {
+fn render_goals(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    snap: &Snapshot,
+    scroll: u16,
+    status: Status,
+    path: &Path,
+) {
+    // Not connected and nothing received yet → explain how to connect.
+    if status != Status::Connected && snap.doc.is_none() {
+        let help = format!(
+            "No lean-helix-view proxy found for this workspace.\n\n\
+             Is Helix running in this project?\n\n\
+             Looking for socket:\n  {}\n\n\
+             Override with:\n  lean-helix-view watch --socket <path>",
+            path.display()
+        );
+        frame.render_widget(
+            Paragraph::new(help)
+                .block(Block::default().borders(Borders::ALL).title(" Goals "))
+                .wrap(Wrap { trim: false })
+                .style(Style::default().fg(Color::DarkGray)),
+            area,
+        );
+        return;
+    }
+
     let body = if !snap.in_tactic {
         if snap.doc.is_some() {
             "not in tactic mode".to_string()
@@ -240,18 +280,79 @@ fn render_goals(frame: &mut ratatui::Frame, area: Rect, snap: &Snapshot, scroll:
     } else {
         snap.goals.join("\n\n")
     };
-    let count = if snap.in_tactic && !snap.goals.is_empty() {
+
+    // Progress gating: if the focus is inside an elaborating region, the goals
+    // may be stale — dim them and say so (milestone-6 refinement).
+    let stale = focus_is_elaborating(snap);
+    let title = if stale {
+        " Goals (elaborating — may be stale) ".to_string()
+    } else if snap.in_tactic && !snap.goals.is_empty() {
         format!(" Goals ({}) ", snap.goals.len())
     } else {
         " Goals ".to_string()
     };
+    let style = if stale {
+        Style::default().add_modifier(Modifier::DIM)
+    } else {
+        Style::default()
+    };
     frame.render_widget(
         Paragraph::new(body)
-            .block(Block::default().borders(Borders::ALL).title(count))
+            .block(Block::default().borders(Borders::ALL).title(title))
             .wrap(Wrap { trim: false })
+            .style(style)
             .scroll((scroll, 0)),
         area,
     );
+}
+
+/// Whether the focused position falls inside a region Lean is still
+/// elaborating (so goals for it may be stale).
+fn focus_is_elaborating(snap: &Snapshot) -> bool {
+    match snap.position {
+        Some(p) => snap
+            .progress
+            .iter()
+            .any(|r| r.start.line <= p.line && p.line <= r.end.line),
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_grows_caps_and_never_hot_spins() {
+        assert_eq!(next_backoff(None), Duration::from_millis(250));
+        let mut d = next_backoff(None);
+        let mut seen = vec![d];
+        for _ in 0..10 {
+            d = next_backoff(Some(d));
+            seen.push(d);
+        }
+        assert!(seen.windows(2).all(|w| w[1] >= w[0]), "non-decreasing");
+        assert_eq!(*seen.last().unwrap(), Duration::from_secs(3), "capped");
+        assert!(
+            seen.iter().all(|d| *d >= Duration::from_millis(250)),
+            "never a tight retry"
+        );
+    }
+
+    #[test]
+    fn focus_inside_elaborating_region_is_stale() {
+        use lhv_wire::{Position, Range};
+        let mut snap = Snapshot {
+            position: Some(Position { line: 4, character: 0 }),
+            ..Snapshot::default()
+        };
+        assert!(!focus_is_elaborating(&snap));
+        snap.progress = vec![Range {
+            start: Position { line: 2, character: 0 },
+            end: Position { line: 6, character: 0 },
+        }];
+        assert!(focus_is_elaborating(&snap));
+    }
 }
 
 fn render_expected(frame: &mut ratatui::Frame, area: Rect, snap: &Snapshot) {

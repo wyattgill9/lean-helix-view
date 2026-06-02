@@ -10,7 +10,8 @@ use tracing_appender::non_blocking::WorkerGuard;
 #[command(
     name = "lean-helix-view",
     version,
-    about = "Terminal-native Lean 4 infoview for Helix"
+    about = "Terminal-native Lean 4 infoview for Helix",
+    propagate_version = true
 )]
 struct Cli {
     #[command(subcommand)]
@@ -62,7 +63,7 @@ fn main() -> std::io::Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(async move {
+    let result = runtime.block_on(async move {
         match cli.command {
             Command::Proxy {
                 debounce_ms,
@@ -83,7 +84,21 @@ fn main() -> std::io::Result<()> {
             }
             Command::Watch { socket } => lhv_viewer::run(socket).await,
         }
-    })
+    });
+
+    // `tokio::io::stdin()` reads on an uncancellable blocking thread; if the
+    // upstream dies while Helix still holds our stdin open, that read is stuck
+    // and a normal runtime drop would wait on it forever. Shut down with a
+    // bounded wait — task destructors (e.g. socket-file cleanup) still run, but
+    // we never wedge. Clean exits, where stdin already closed, return at once.
+    runtime.shutdown_timeout(Duration::from_millis(200));
+
+    // Clean, single-line error to stderr (never stdout) — Helix captures it.
+    if let Err(e) = result {
+        eprintln!("lean-helix-view: {e}");
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 /// Initialize tracing to a file in the XDG state dir.

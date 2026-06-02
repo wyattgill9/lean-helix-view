@@ -14,6 +14,8 @@
 //! consumed and never reach Helix; everything else stays byte-identical.
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use lhv_lsp::{Envelope, Frame, Id, read_frame, write_frame};
@@ -114,12 +116,14 @@ async fn pump_s2c<R>(
     to_helix_tx: mpsc::Sender<Frame>,
     outstanding: Outstanding,
     state: StateHandle,
+    spoke: Arc<AtomicBool>,
 ) where
     R: AsyncBufRead + Unpin,
 {
     loop {
         match read_frame(&mut server_in).await {
             Ok(Some(frame)) => {
+                spoke.store(true, Ordering::Relaxed); // upstream produced output
                 let envelope = Envelope::parse(frame.body());
 
                 // Consume responses to ids WE injected — exact match, never forwarded.
@@ -180,6 +184,7 @@ pub struct Forwarder {
     lean_writer: JoinHandle<()>,
     helix_writer: JoinHandle<()>,
     outstanding: Outstanding,
+    spoke: Arc<AtomicBool>,
 }
 
 impl Forwarder {
@@ -202,6 +207,7 @@ impl Forwarder {
         let (to_helix_tx, to_helix_rx) = mpsc::channel::<Frame>(SINK_CAPACITY);
         let (snoop_tx, snoop_rx) = mpsc::channel::<Vec<u8>>(SNOOP_CAPACITY);
         let outstanding = Outstanding::new();
+        let spoke = Arc::new(AtomicBool::new(false));
 
         let lean_writer = tokio::spawn(writer(lean_in, to_lean_rx));
         let helix_writer = tokio::spawn(writer(helix_out, to_helix_rx));
@@ -221,7 +227,13 @@ impl Forwarder {
         ));
 
         let c2s = tokio::spawn(pump_c2s(helix_in, to_lean_tx, snoop_tx));
-        let s2c = tokio::spawn(pump_s2c(lean_out, to_helix_tx, outstanding.clone(), state));
+        let s2c = tokio::spawn(pump_s2c(
+            lean_out,
+            to_helix_tx,
+            outstanding.clone(),
+            state,
+            spoke.clone(),
+        ));
 
         Forwarder {
             c2s,
@@ -230,7 +242,14 @@ impl Forwarder {
             lean_writer,
             helix_writer,
             outstanding,
+            spoke,
         }
+    }
+
+    /// Whether the upstream ever produced output. Used to tell "died during
+    /// startup" (never spoke) from "exited after a session" (normal shutdown).
+    pub fn server_spoke(&self) -> bool {
+        self.spoke.load(Ordering::Relaxed)
     }
 
     /// The shared outstanding-id registry. Exposed for tests that pre-register

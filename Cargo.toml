@@ -9,9 +9,13 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "MIT"
+description = "Terminal-native Lean 4 infoview for Helix: a transparent LSP proxy plus a ratatui viewer"
+repository = "https://github.com/wyattgill9/lean-helix-tui"
+keywords = ["lean", "lean4", "helix", "lsp", "infoview"]
+categories = ["development-tools", "command-line-utilities"]
 
 [workspace.dependencies]
 tokio = { version = "1", default-features = false }
