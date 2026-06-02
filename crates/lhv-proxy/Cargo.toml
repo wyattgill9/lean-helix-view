@@ -1,0 +1,28 @@
+[package]
+name = "lhv-proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lhv-lsp = { workspace = true }
+lhv-wire = { workspace = true }
+tokio = { workspace = true, features = [
+    "rt",
+    "macros",
+    "io-util",
+    "io-std",
+    "process",
+    "net",
+    "sync",
+    "time",
+] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "io-util", "sync", "time"] }

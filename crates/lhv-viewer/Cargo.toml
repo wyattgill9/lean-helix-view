@@ -1,0 +1,14 @@
+[package]
+name = "lhv-viewer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lhv-lsp = { workspace = true }
+lhv-wire = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros", "io-util", "net", "sync", "time"] }
+serde_json = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+tracing = { workspace = true }

@@ -1,6 +1,32 @@
-[package]
-name = "lean-helix-view"
+[workspace]
+resolver = "2"
+members = [
+    "crates/lhv-lsp",
+    "crates/lhv-wire",
+    "crates/lhv-proxy",
+    "crates/lhv-viewer",
+    "crates/lean-helix-view",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
 
-[dependencies]
+[workspace.dependencies]
+tokio = { version = "1", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+ratatui = "0.29"
+crossterm = "0.28"
+thiserror = "2"
+
+# internal crates
+lhv-lsp = { path = "crates/lhv-lsp" }
+lhv-wire = { path = "crates/lhv-wire" }
+lhv-proxy = { path = "crates/lhv-proxy" }
+lhv-viewer = { path = "crates/lhv-viewer" }

@@ -1,0 +1,18 @@
+[package]
+name = "lean-helix-view"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "lean-helix-view"
+path = "src/main.rs"
+
+[dependencies]
+lhv-proxy = { workspace = true }
+lhv-viewer = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
