@@ -22,7 +22,7 @@ use lhv_wire::{DocRef, Position};
 use serde::Serialize;
 use serde_json::Value;
 use tokio::io::{AsyncWriteExt, BufWriter};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::json::parse_position;
 use crate::query::Querier;
@@ -75,6 +75,8 @@ pub struct Observation {
     pub uri: Option<String>,
     pub position: Option<Position>,
     pub version: Option<i32>,
+    /// The workspace root URI, set only for the `initialize` request.
+    pub root_uri: Option<String>,
     /// In the active trigger set?
     pub is_trigger: bool,
     /// Set iff this message produced a (legal) focus to query.
@@ -110,6 +112,7 @@ impl Snoop {
         let params = value.get("params");
 
         match method {
+            Some("initialize") => obs.root_uri = params.and_then(extract_root_uri),
             Some("initialized") => self.initialized = true,
             Some("textDocument/didOpen") => {
                 if let Some(td) = params.and_then(|p| p.get("textDocument")) {
@@ -201,6 +204,24 @@ impl Snoop {
     }
 }
 
+/// Pull the workspace root from `initialize` params: `rootUri`, else the first
+/// `workspaceFolders` uri, else the legacy `rootPath`.
+fn extract_root_uri(params: &Value) -> Option<String> {
+    if let Some(uri) = params.get("rootUri").and_then(Value::as_str) {
+        return Some(uri.to_owned());
+    }
+    if let Some(uri) = params
+        .get("workspaceFolders")
+        .and_then(Value::as_array)
+        .and_then(|folders| folders.first())
+        .and_then(|f| f.get("uri"))
+        .and_then(Value::as_str)
+    {
+        return Some(uri.to_owned());
+    }
+    params.get("rootPath").and_then(Value::as_str).map(str::to_owned)
+}
+
 /// One line of the cadence capture (milestone 3). JSON-lines.
 #[derive(Serialize)]
 struct CaptureRecord<'a> {
@@ -224,6 +245,7 @@ pub async fn run_snoop_task(
     debounce: Duration,
     triggers: Vec<String>,
     capture_path: Option<PathBuf>,
+    mut root_tx: Option<oneshot::Sender<Option<String>>>,
 ) {
     let mut snoop = Snoop::new(triggers);
     let mut pending: Option<Focus> = None;
@@ -239,6 +261,12 @@ pub async fn run_snoop_task(
                 let obs = snoop.observe(&body);
                 if let Some(writer) = capture.as_mut() {
                     write_capture(writer, &obs).await;
+                }
+                // Signal the workspace root once, so the socket can bind lazily.
+                if obs.method.as_deref() == Some("initialize") {
+                    if let Some(tx) = root_tx.take() {
+                        let _ = tx.send(obs.root_uri.clone());
+                    }
                 }
                 if let Some(focus) = obs.focus {
                     pending = Some(focus);

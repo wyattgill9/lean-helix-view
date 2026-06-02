@@ -37,6 +37,9 @@ enum Command {
         /// are prefixed with `textDocument/`; omit entirely for the default set.
         #[arg(long = "trigger", value_name = "METHOD")]
         triggers: Vec<String>,
+        /// Override the viewer socket path (default: workspace-root-keyed).
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
         #[arg(last = true, required = true, value_name = "UPSTREAM")]
         upstream: Vec<String>,
     },
@@ -66,6 +69,7 @@ fn main() -> std::io::Result<()> {
                 capture,
                 goal_sink,
                 triggers,
+                socket,
                 upstream,
             } => {
                 let config = lhv_proxy::Config {
@@ -73,6 +77,7 @@ fn main() -> std::io::Result<()> {
                     triggers,
                     capture_path: capture,
                     goal_sink_path: goal_sink,
+                    socket_path: socket,
                 };
                 lhv_proxy::run(upstream, config).await
             }

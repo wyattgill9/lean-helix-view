@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use tokio::io::BufReader;
 use tokio::process::{Child, Command};
+use tokio::sync::oneshot;
 use tokio::time::timeout;
 
 use crate::forward::{FirstClosed, Forwarder, SnoopConfig};
@@ -27,8 +28,10 @@ pub struct Config {
     pub triggers: Vec<String>,
     /// If set, record a client→server cadence capture (JSON-lines).
     pub capture_path: Option<PathBuf>,
-    /// If set, write goal snapshots (JSON-lines) to this headless sink.
+    /// If set, also write goal snapshots (JSON-lines) to this debug sink.
     pub goal_sink_path: Option<PathBuf>,
+    /// Override the viewer socket path (default: workspace-root-keyed).
+    pub socket_path: Option<PathBuf>,
 }
 
 /// Run the proxy until Helix or Lean closes. `upstream` is the configurable
@@ -54,8 +57,12 @@ pub async fn run(upstream: Vec<String>, config: Config) -> io::Result<()> {
 
     let state = StateHandle::new();
 
-    // Headless goal sink (milestones 3–4): the first consumer of the viewer
-    // channel. The socket server + ratatui viewer replace it in milestone 5.
+    // The snoop signals the workspace root (from `initialize`) once; the socket
+    // binds lazily off that. A `--socket` override binds immediately instead.
+    let (root_tx, root_rx) = oneshot::channel::<Option<String>>();
+    spawn_socket_server(state.clone(), config.socket_path.clone(), root_rx);
+
+    // Optional debug goal sink (the headless JSON-lines consumer from m3–4).
     if let Some(path) = config.goal_sink_path.clone() {
         let rx = state.subscribe();
         tokio::spawn(async move {
@@ -78,6 +85,7 @@ pub async fn run(upstream: Vec<String>, config: Config) -> io::Result<()> {
         BufReader::new(lean_out),
         state,
         snoop_config,
+        Some(root_tx),
     );
 
     match fwd.wait_first().await {
@@ -96,6 +104,36 @@ pub async fn run(upstream: Vec<String>, config: Config) -> io::Result<()> {
     fwd.drain_writers().await;
     tracing::info!("proxy exiting");
     Ok(())
+}
+
+/// Spawn the viewer socket server. With an explicit `override_path` it binds at
+/// once; otherwise it waits for the snoop's `rootUri` signal and keys the path
+/// off the workspace root. If `initialize` is never seen, no socket is created.
+fn spawn_socket_server(
+    state: StateHandle,
+    override_path: Option<PathBuf>,
+    root_rx: oneshot::Receiver<Option<String>>,
+) {
+    tokio::spawn(async move {
+        let path = match override_path {
+            Some(path) => path,
+            None => match root_rx.await {
+                Ok(root_uri) => {
+                    let root = root_uri
+                        .map(|uri| lhv_wire::root_path_from_uri(&uri))
+                        .unwrap_or_else(lhv_wire::cwd_root);
+                    lhv_wire::socket_path_for_root(&root)
+                }
+                Err(_) => {
+                    tracing::debug!("no initialize observed; viewer socket not bound");
+                    return;
+                }
+            },
+        };
+        if let Err(e) = crate::server::serve(path, state).await {
+            tracing::warn!(error = %e, "viewer socket server ended");
+        }
+    });
 }
 
 /// Wait for the child to exit, killing it if it overstays the grace window —

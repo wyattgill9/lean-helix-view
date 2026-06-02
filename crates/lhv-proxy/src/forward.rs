@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use lhv_lsp::{Envelope, Frame, Id, read_frame, write_frame};
 use tokio::io::{AsyncBufRead, AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::query::{Outstanding, Querier, handle_injected_response};
@@ -190,6 +190,7 @@ impl Forwarder {
         lean_out: LOut,
         state: StateHandle,
         config: SnoopConfig,
+        root_tx: Option<oneshot::Sender<Option<String>>>,
     ) -> Forwarder
     where
         HIn: AsyncBufRead + Unpin + Send + 'static,
@@ -216,6 +217,7 @@ impl Forwarder {
             config.debounce,
             config.triggers,
             config.capture_path,
+            root_tx,
         ));
 
         let c2s = tokio::spawn(pump_c2s(helix_in, to_lean_tx, snoop_tx));
@@ -299,6 +301,7 @@ mod tests {
             BufReader::new(proxy_from_lean),
             state.clone(),
             SnoopConfig::default(),
+            None,
         );
 
         // Pre-register an injected id at the latest generation.
@@ -386,6 +389,7 @@ mod tests {
             BufReader::new(proxy_from_lean),
             state.clone(),
             config,
+            None,
         );
 
         // Mock Lean: respond to injected queries, emit diagnostics/progress and a
@@ -487,6 +491,7 @@ mod tests {
             Duration::from_millis(40),
             default_triggers(),
             None,
+            None,
         ));
 
         snoop_tx.send(body(json!({"method":"initialized"}))).await.unwrap();
@@ -528,6 +533,7 @@ mod tests {
             querier,
             Duration::from_millis(10),
             default_triggers(),
+            None,
             None,
         ));
 

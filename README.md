@@ -10,16 +10,17 @@ forwards everything untouched, and — later — watches the position-carrying
 requests Helix sends so it can issue its own goal queries and publish them to a
 viewer pane.
 
-**Status:** milestones 1–4 complete. The proxy is byte-for-byte transparent
-(completions, diagnostics, goto-def all behave exactly as if talking to
-`lake serve` directly) with full lifecycle handling. The goal-view seams are now
-active: the snoop tracks session + cursor focus, the querier debounces and
-injects `plainGoal` / `plainTermGoal` through the shared Lean-stdin writer,
-their responses are consumed (never leaked to Helix) and folded into state along
-with teed diagnostics + progress, and a headless JSON-lines sink exposes that
-state. There's also a `--capture` instrumentation mode for measuring Helix's
-update cadence — see [docs/cadence-capture.md](docs/cadence-capture.md). The
-Unix socket and ratatui viewer remain dormant until milestone 5.
+**Status:** milestones 1–5 complete — it works end-to-end. The proxy is
+byte-for-byte transparent (completions, diagnostics, goto-def all behave exactly
+as if talking to `lake serve` directly) with full lifecycle handling. The snoop
+tracks session + cursor focus; the querier debounces and injects `plainGoal` /
+`plainTermGoal` through the shared Lean-stdin writer; their responses are
+consumed (never leaked to Helix) and folded into state with teed diagnostics +
+progress; and a Unix-socket server publishes that state to the `watch` ratatui
+viewer in an adjacent pane. The publish path is fully decoupled from the LSP
+pipe (a `watch` channel, drop-to-latest, never awaits a viewer). A `--capture`
+mode measures Helix's update cadence — see
+[docs/cadence-capture.md](docs/cadence-capture.md). Milestone 6 (polish) remains.
 
 ## Layout
 
@@ -31,7 +32,7 @@ Cargo workspace:
 | `lhv-lsp`        | `Content-Length` frame codec + thin envelope parse. Pure, no I/O policy. |
 | `lhv-wire`       | serde types for the proxy↔viewer protocol. One source of truth.   |
 | `lhv-proxy`      | forwarder, snoop, goal querier, state store, socket server.       |
-| `lhv-viewer`     | socket client + (milestone 5) ratatui TUI.                        |
+| `lhv-viewer`     | ratatui TUI + socket client, with a reconnect loop.               |
 | `lean-helix-view`| thin bin: clap arg parsing, dispatches `proxy` / `watch`.         |
 
 ### The sacred pipe
@@ -89,8 +90,27 @@ language-servers = ["lean"]
   the default position-request set). See
   [docs/cadence-capture.md](docs/cadence-capture.md).
 
-After this, Helix should behave exactly as before — the proxy is invisible. The
-viewer (`lean-helix-view watch`) and its socket arrive in milestone 5.
+After this, Helix should behave exactly as before — the proxy is invisible.
+
+## Launching the viewer
+
+Helix's config is unchanged (it just launches the `proxy` as above). The viewer
+is a separate process you run in an adjacent pane:
+
+```sh
+# from your Lean project root (same dir Helix opened), in a tmux/zellij pane:
+lean-helix-view watch
+# or point it explicitly:
+lean-helix-view watch --socket /run/user/$UID/lean-helix-view/<hash>.sock
+```
+
+The viewer auto-discovers the socket by hashing the workspace root (its current
+directory must match Helix's `rootUri` — run it from the project root, or use
+`--socket`). It connects whenever the proxy appears and reconnects across proxy
+restarts, so launch order doesn't matter. Keys: `q`/`Esc` quit, `j`/`k` (or
+arrows) scroll goals, `g`/`Home` jump to top. It renders Goals, Expected type,
+Diagnostics, and a Progress (elaborating) indicator, with a connection-status
+line.
 
 ## Roadmap
 
@@ -100,6 +120,7 @@ viewer (`lean-helix-view watch`) and its socket arrive in milestone 5.
    to measure cadence; decide the update model from data, not assumption.
 4. ✅ Snoop + goal querier + injection: focus tracking, debounce, supersession,
    consume-injected-id (no leak), tee diagnostics/progress, headless `--goal-sink`.
-5. Socket + minimal viewer (goals), then expected-type, diagnostics, progress.
-6. Polish: debounce tuning, reconnect/replay, `fileProgress` gating,
-   workspace-root-keyed socket discovery.
+5. ✅ Socket server (rootUri-keyed, replay-on-connect, drop-to-latest) + the
+   `watch` ratatui viewer: Goals / Expected type / Diagnostics / Progress.
+6. Polish: debounce tuning, robust reconnect/backoff, `fileProgress` goal-gating
+   (stale-goal dimming), multi-instance socket discovery.

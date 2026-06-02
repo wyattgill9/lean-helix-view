@@ -149,6 +149,7 @@ pub fn handle_injected_response(state: &StateHandle, pending: Pending, body: &[u
     };
     let result = value.get("result");
     let doc = pending.doc;
+    let position = pending.position;
 
     match pending.kind {
         QueryKind::PlainGoal => {
@@ -169,6 +170,7 @@ pub fn handle_injected_response(state: &StateHandle, pending: Pending, body: &[u
                 .map(str::to_owned);
             state.update(move |s| {
                 s.doc = Some(doc);
+                s.position = Some(position);
                 s.in_tactic = in_tactic;
                 s.goals = goals;
                 s.rendered = rendered;
@@ -181,6 +183,7 @@ pub fn handle_injected_response(state: &StateHandle, pending: Pending, body: &[u
                 .map(str::to_owned);
             state.update(move |s| {
                 s.doc = Some(doc);
+                s.position = Some(position);
                 s.term_goal = term;
             });
         }

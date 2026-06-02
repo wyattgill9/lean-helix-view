@@ -1,14 +1,16 @@
 //! The proxy → viewer protocol: a single source of truth for both ends.
 //!
 //! The proxy holds one authoritative [`Snapshot`] and ships **full snapshots**
-//! (never deltas) on every change. Snapshots are small and idempotent, so a
-//! reconnecting viewer needs no bookkeeping — it just renders the latest one.
+//! (never deltas) on every change and on connect. Snapshots are small,
+//! idempotent, and last-write-wins, so a reconnecting viewer needs no
+//! bookkeeping — it just renders the latest one.
 //!
 //! Messages travel over the viewer socket framed by `lhv-lsp`'s codec, with
 //! [`ServerMsg`] as the JSON body. Both ends ship in one binary, so versions
 //! match by construction and there is no protocol negotiation.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -33,12 +35,15 @@ impl ServerMsg {
     }
 }
 
-/// The complete state the viewer renders. `Default` is the empty state shown
-/// before any goal query has resolved.
+/// The complete, focus-centric state the viewer renders. `Default` is the empty
+/// "waiting for goals" state a freshly connected viewer may receive before any
+/// query has resolved.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
     /// The document + version the goal fields describe, if known.
     pub doc: Option<DocRef>,
+    /// The cursor position the snapshot describes (the focus).
+    pub position: Option<Position>,
     /// `$/lean/plainGoal` goals. Empty vec = proof complete at this position;
     /// the distinction from "no tactic goals here" is carried by `in_tactic`.
     pub goals: Vec<String>,
@@ -48,14 +53,13 @@ pub struct Snapshot {
     pub term_goal: Option<String>,
     /// Whether the position is inside tactic mode at all (plainGoal non-null).
     pub in_tactic: bool,
-    /// True while `$/lean/fileProgress` reports the position's region as still
-    /// elaborating; the viewer dims possibly-stale goals.
+    /// True while `$/lean/fileProgress` reports a region as still elaborating.
     pub elaborating: bool,
     /// `textDocument/publishDiagnostics`, keyed by document URI.
     pub diagnostics: BTreeMap<String, Vec<Diagnostic>>,
     /// `$/lean/fileProgress` ranges currently being elaborated.
     pub progress: Vec<Range>,
-    /// Monotonic counter, bumped on every state change. Lets the viewer ignore
+    /// Monotonic counter, bumped on every state change. Lets a viewer ignore
     /// anything older than what it has already shown.
     pub seq: u64,
 }
@@ -111,16 +115,81 @@ impl Severity {
     }
 }
 
-/// The default viewer socket path, shared by the proxy (server) and the viewer
-/// (client) so they meet at the same place by construction.
-///
-/// Workspace-root-keyed discovery is a later milestone; for v1 this is a fixed
-/// per-user path under the XDG runtime dir, falling back to the temp dir.
-pub fn default_socket_path() -> std::path::PathBuf {
+// ---- Socket discovery -------------------------------------------------------
+//
+// The proxy and viewer meet at a per-workspace socket. The proxy keys it off the
+// `rootUri` from `initialize` (canonicalized to a filesystem path); the viewer,
+// lacking that, keys off its current directory. For the common case — Helix
+// opened in the project root, `watch` run there too — both canonicalize to the
+// same path and hash to the same socket. `--socket` overrides when they don't.
+
+/// The directory holding per-workspace sockets.
+pub fn socket_dir() -> PathBuf {
     let base = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(std::path::PathBuf::from)
+        .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    base.join("lean-helix-view.sock")
+    base.join("lean-helix-view")
+}
+
+/// The socket path for a canonical workspace-root path.
+pub fn socket_path_for_root(root_path: &str) -> PathBuf {
+    socket_dir().join(format!("{:016x}.sock", fnv1a64(root_path.as_bytes())))
+}
+
+/// Canonical filesystem path for a workspace, from an LSP `rootUri`. Falls back
+/// to the (decoded) literal when the path can't be canonicalized.
+pub fn root_path_from_uri(uri: &str) -> String {
+    let raw = uri.strip_prefix("file://").unwrap_or(uri);
+    canonical(&percent_decode(raw))
+}
+
+/// Canonical path of the current directory — the viewer's default root.
+pub fn cwd_root() -> String {
+    std::env::current_dir()
+        .map(|p| canonical(&p.to_string_lossy()))
+        .unwrap_or_else(|_| ".".to_string())
+}
+
+fn canonical(path: &str) -> String {
+    std::fs::canonicalize(path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string())
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                out.push((h << 4) | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -129,13 +198,31 @@ mod tests {
 
     #[test]
     fn snapshot_roundtrips_through_servermsg() {
-        let mut snap = Snapshot::default();
-        snap.goals = vec!["⊢ True".into()];
-        snap.in_tactic = true;
-        snap.seq = 5;
+        let snap = Snapshot {
+            goals: vec!["⊢ True".into()],
+            in_tactic: true,
+            position: Some(Position { line: 3, character: 1 }),
+            seq: 5,
+            ..Snapshot::default()
+        };
         let bytes = ServerMsg::Snapshot(snap.clone()).to_json();
         match ServerMsg::from_json(&bytes).unwrap() {
             ServerMsg::Snapshot(got) => assert_eq!(got, snap),
         }
+    }
+
+    #[test]
+    fn socket_path_is_deterministic_and_uri_agrees_with_path() {
+        let a = socket_path_for_root("/home/u/proj");
+        assert_eq!(a, socket_path_for_root("/home/u/proj"));
+        assert_ne!(a, socket_path_for_root("/home/u/other"));
+        // For a path that can't be canonicalized we fall back to the literal,
+        // so a `file://` rootUri and a bare path for the same place agree.
+        assert_eq!(socket_path_for_root(&root_path_from_uri("file:///home/u/proj")), a);
+    }
+
+    #[test]
+    fn percent_decoding_in_root_uri() {
+        assert_eq!(root_path_from_uri("file:///home/a%20b/p"), "/home/a b/p");
     }
 }
