@@ -1,5 +1,7 @@
 # lean-helix-view
 
+<img width="1470" height="892" alt="lean-tui-view" src="https://github.com/user-attachments/assets/d83b813d-d8ed-4cdd-8e31-cbce5276e4cb" />
+
 A terminal-native Lean 4 infoview for [Helix](https://helix-editor.com), built
 **without modifying Helix or Lean**. It shows live goal / expected-type /
 diagnostics state in a tmux/zellij pane next to the editor.
