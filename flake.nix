@@ -25,6 +25,7 @@
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
           strictDeps = true;
+          doCheck = false;
         };
         devShells.default = pkgs.mkShell {
           packages = [

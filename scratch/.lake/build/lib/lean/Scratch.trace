@@ -1,0 +1,33 @@
+{"synthetic": false,
+ "schemaVersion": "2025-09-10",
+ "outputs":
+ {"o": ["42b8a77c86dea566.olean"],
+  "m": false,
+  "i": "06eab3dc6400fbbd.ilean",
+  "c": "b64abe02b7beb875.c"},
+ "log":
+ [{"message":
+   ".> LEAN_PATH=/Users/wyattgill/Github/lean-helix-view/scratch/.lake/build/lib/lean /Users/wyattgill/.elan/toolchains/leanprover--lean4---v4.30.0/bin/lean /Users/wyattgill/Github/lean-helix-view/scratch/Scratch.lean -o /Users/wyattgill/Github/lean-helix-view/scratch/.lake/build/lib/lean/Scratch.olean -i /Users/wyattgill/Github/lean-helix-view/scratch/.lake/build/lib/lean/Scratch.ilean -c /Users/wyattgill/Github/lean-helix-view/scratch/.lake/build/ir/Scratch.c --setup /Users/wyattgill/Github/lean-helix-view/scratch/.lake/build/ir/Scratch.setup.json --json",
+   "level": "trace"},
+  {"message": "Scratch.lean:20:0: declaration uses `sorry`",
+   "level": "warning"}],
+ "inputs":
+ [["Scratch:deps",
+   [["deps",
+     [["scratch/Scratch:extraDep", [["@scratch:extraDep", "00000000000006bb"]]],
+      ["imports", "00000000000006bb"]]],
+    ["libs",
+     [["import dynlibs", "00000000000006bb"],
+      ["package external libraries", "00000000000006bb"],
+      ["module dynlibs", "00000000000006bb"],
+      ["module plugins", "00000000000006bb"]]]]],
+  ["Lean 4.30.0, commit d024af099ca4bf2c86f649261ebf59565dc8c622",
+   "2f4703bb19086252"],
+  ["/Users/wyattgill/Github/lean-helix-view/scratch/Scratch.lean",
+   "e912a3f89aa93699"],
+  ["options", "00000000000006bb"],
+  ["isModule: false", "feefd2a0d3a1847e"],
+  ["Module.name: Scratch", "17db247766b52a13"],
+  ["Package.id?: (some scratch)", "b40505066fa2d3ae"],
+  ["Module.leanArgs: #[]", "00000000000006bb"]],
+ "depHash": "dce91041ca83bc14"}
