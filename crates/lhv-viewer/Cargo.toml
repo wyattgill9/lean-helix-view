@@ -12,3 +12,5 @@ serde_json = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 tracing = { workspace = true }
+tree-sitter-highlight = { workspace = true }
+tree-sitter-lean = { workspace = true }

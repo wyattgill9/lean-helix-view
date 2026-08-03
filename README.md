@@ -130,7 +130,8 @@ directory must match Helix's `rootUri` — run it from the project root, or use
 restarts, so launch order doesn't matter. Keys: `q`/`Esc` quit, `j`/`k` (or
 arrows) scroll goals, `g`/`Home` jump to top. It renders Goals, Expected type,
 Diagnostics, and a Progress (elaborating) indicator, with a connection-status
-line.
+line. Goal and expected-type code blocks are rendered without their Markdown
+fences and highlighted with the Lean tree-sitter grammar.
 
 ## Troubleshooting
 
