@@ -28,6 +28,8 @@ tracing-appender = "0.2"
 ratatui = "0.29"
 crossterm = "0.28"
 thiserror = "2"
+tree-sitter-highlight = "0.25"
+tree-sitter-lean = { git = "https://github.com/Julian/tree-sitter-lean", rev = "86c2bcb379fe0b2ad13d8b3411400deff75b2785" }
 
 # internal crates
 lhv-lsp = { path = "crates/lhv-lsp" }

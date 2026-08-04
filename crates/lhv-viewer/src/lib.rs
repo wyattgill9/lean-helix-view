@@ -8,7 +8,7 @@
 
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -22,11 +22,12 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use tokio::io::BufReader;
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
+use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Status {
@@ -189,7 +190,12 @@ impl Drop for TerminalGuard {
     }
 }
 
-fn draw(terminal: &mut Tui, state: &Arc<Mutex<ViewerState>>, path: &Path, tick: u64) -> io::Result<()> {
+fn draw(
+    terminal: &mut Tui,
+    state: &Arc<Mutex<ViewerState>>,
+    path: &Path,
+    tick: u64,
+) -> io::Result<()> {
     let (snapshot, status, scroll) = {
         let s = state.lock().unwrap();
         (s.snapshot.clone(), s.status, s.scroll)
@@ -198,7 +204,14 @@ fn draw(terminal: &mut Tui, state: &Arc<Mutex<ViewerState>>, path: &Path, tick: 
     Ok(())
 }
 
-fn ui(frame: &mut ratatui::Frame, snap: &Snapshot, status: Status, scroll: u16, path: &Path, tick: u64) {
+fn ui(
+    frame: &mut ratatui::Frame,
+    snap: &Snapshot,
+    status: Status,
+    scroll: u16,
+    path: &Path,
+    tick: u64,
+) {
     let regions = Layout::vertical([
         Constraint::Length(1), // status
         Constraint::Min(6),    // goals (primary)
@@ -215,14 +228,23 @@ fn ui(frame: &mut ratatui::Frame, snap: &Snapshot, status: Status, scroll: u16, 
     render_progress(frame, regions[4], snap, tick);
 }
 
-fn render_status(frame: &mut ratatui::Frame, area: Rect, snap: &Snapshot, status: Status, path: &Path) {
+fn render_status(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    snap: &Snapshot,
+    status: Status,
+    path: &Path,
+) {
     let (label, color) = match status {
         Status::Connected => ("connected", Color::Green),
         Status::Waiting => ("waiting for proxy…", Color::Yellow),
         Status::Disconnected => ("disconnected, retrying…", Color::Red),
     };
     let mut spans = vec![
-        Span::styled(" lean-helix-view ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " lean-helix-view ",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
         Span::styled(label, Style::default().fg(color)),
     ];
     if let (Some(doc), Some(pos)) = (&snap.doc, &snap.position) {
@@ -267,18 +289,23 @@ fn render_goals(
         return;
     }
 
-    let body = if !snap.in_tactic {
+    let (body, is_lean) = if !snap.in_tactic {
         if snap.doc.is_some() {
-            "not in tactic mode".to_string()
+            ("not in tactic mode".to_string(), false)
         } else {
-            "waiting for goals…".to_string()
+            ("waiting for goals…".to_string(), false)
         }
     } else if snap.goals.is_empty() {
-        "no goals — proof complete here".to_string()
+        ("no goals — proof complete here".to_string(), false)
     } else if let Some(rendered) = &snap.rendered {
-        rendered.clone()
+        (rendered.clone(), true)
     } else {
-        snap.goals.join("\n\n")
+        (snap.goals.join("\n\n"), true)
+    };
+    let body = if is_lean {
+        highlighted_lean(body.as_str())
+    } else {
+        plain_text(body.as_str())
     };
 
     // Progress gating: if the focus is inside an elaborating region, the goals
@@ -304,6 +331,191 @@ fn render_goals(
             .scroll((scroll, 0)),
         area,
     );
+}
+
+const LEAN_HIGHLIGHT_NAMES: &[&str] = &[
+    "attribute",
+    "boolean",
+    "character",
+    "comment",
+    "comment.documentation",
+    "constructor",
+    "function",
+    "function.call",
+    "keyword",
+    "keyword.conditional",
+    "keyword.directive",
+    "keyword.exception",
+    "keyword.function",
+    "keyword.import",
+    "keyword.modifier",
+    "keyword.operator",
+    "module",
+    "namespace",
+    "number",
+    "number.float",
+    "operator",
+    "property",
+    "punctuation.bracket",
+    "punctuation.delimiter",
+    "string",
+    "string.escape",
+    "string.special",
+    "string.special.symbol",
+    "type",
+    "type.builtin",
+    "type.parameter",
+    "variable",
+    "variable.builtin",
+    "variable.parameter",
+];
+
+fn lean_highlight_config() -> Option<&'static HighlightConfiguration> {
+    static CONFIG: OnceLock<Option<HighlightConfiguration>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            let mut config = HighlightConfiguration::new(
+                tree_sitter_lean::LANGUAGE.into(),
+                "lean",
+                tree_sitter_lean::HIGHLIGHTS_QUERY,
+                tree_sitter_lean::INJECTIONS_QUERY,
+                tree_sitter_lean::LOCALS_QUERY,
+            )
+            .ok()?;
+            config.configure(LEAN_HIGHLIGHT_NAMES);
+            Some(config)
+        })
+        .as_ref()
+}
+
+/// Lean's plain-goal protocol returns Markdown code blocks. The viewer owns
+/// their presentation, so remove one complete outer fence before rendering.
+fn strip_outer_code_fence(text: &str) -> &str {
+    let Some((opening, rest)) = text.split_once('\n') else {
+        return text;
+    };
+    let opening = opening.trim();
+    if !opening.starts_with("```") || opening.as_bytes().get(3) == Some(&b'`') {
+        return text;
+    }
+
+    let rest = rest.trim_end_matches(['\r', '\n']);
+    if rest.trim() == "```" {
+        return "";
+    }
+    let Some((body, closing)) = rest.rsplit_once('\n') else {
+        return text;
+    };
+    if closing.trim() == "```" { body } else { text }
+}
+
+fn plain_text(source: &str) -> Text<'static> {
+    Text::from(
+        source
+            .split('\n')
+            .map(|line| Line::from(line.trim_end_matches('\r').to_string()))
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn highlighted_lean(markdown: &str) -> Text<'static> {
+    let source = strip_outer_code_fence(markdown);
+    let Some(config) = lean_highlight_config() else {
+        return plain_text(source);
+    };
+    let mut highlighter = Highlighter::new();
+    let Ok(events) = highlighter.highlight(config, source.as_bytes(), None, |_| None) else {
+        return plain_text(source);
+    };
+
+    let mut lines = Vec::new();
+    let mut spans = Vec::new();
+    let mut styles = vec![Style::default()];
+    for event in events {
+        match event {
+            Ok(HighlightEvent::Source { start, end }) => {
+                push_source(
+                    &mut lines,
+                    &mut spans,
+                    &source[start..end],
+                    *styles.last().unwrap(),
+                );
+            }
+            Ok(HighlightEvent::HighlightStart(highlight)) => {
+                styles.push(highlight_style(highlight.0));
+            }
+            Ok(HighlightEvent::HighlightEnd) => {
+                if styles.len() > 1 {
+                    styles.pop();
+                }
+            }
+            Err(_) => return plain_text(source),
+        }
+    }
+    lines.push(Line::from(spans));
+    Text::from(lines)
+}
+
+fn push_source(
+    lines: &mut Vec<Line<'static>>,
+    spans: &mut Vec<Span<'static>>,
+    source: &str,
+    style: Style,
+) {
+    for (index, part) in source.split('\n').enumerate() {
+        if index > 0 {
+            lines.push(Line::from(std::mem::take(spans)));
+        }
+        let part = part.trim_end_matches('\r');
+        if style == Style::default() {
+            push_plain_operators(spans, part);
+        } else if !part.is_empty() {
+            spans.push(Span::styled(part.to_string(), style));
+        }
+    }
+}
+
+fn push_plain_operators(spans: &mut Vec<Span<'static>>, source: &str) {
+    let mut rest = source;
+    while let Some(index) = rest.find('⊢') {
+        if index > 0 {
+            spans.push(Span::raw(rest[..index].to_string()));
+        }
+        spans.push(Span::styled(
+            "⊢",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+        rest = &rest[index + '⊢'.len_utf8()..];
+    }
+    if !rest.is_empty() {
+        spans.push(Span::raw(rest.to_string()));
+    }
+}
+
+fn highlight_style(index: usize) -> Style {
+    let name = LEAN_HIGHLIGHT_NAMES.get(index).copied().unwrap_or_default();
+    match name.split('.').next().unwrap_or_default() {
+        "attribute" => Style::default().fg(Color::Yellow),
+        "boolean" | "number" => Style::default().fg(Color::LightMagenta),
+        "character" | "string" => Style::default().fg(Color::LightGreen),
+        "comment" => Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
+        "constructor" | "type" => Style::default().fg(Color::LightCyan),
+        "function" => Style::default().fg(Color::LightBlue),
+        "keyword" => Style::default()
+            .fg(Color::LightMagenta)
+            .add_modifier(Modifier::BOLD),
+        "module" | "namespace" => Style::default().fg(Color::Blue),
+        "operator" => Style::default().fg(Color::Yellow),
+        "property" => Style::default().fg(Color::Cyan),
+        "punctuation" => Style::default().fg(Color::DarkGray),
+        "variable" if name.ends_with("builtin") => Style::default().fg(Color::LightRed),
+        "variable" if name.ends_with("parameter") => Style::default().fg(Color::Cyan),
+        _ => Style::default(),
+    }
 }
 
 /// Whether the focused position falls inside a region Lean is still
@@ -343,23 +555,68 @@ mod tests {
     fn focus_inside_elaborating_region_is_stale() {
         use lhv_wire::{Position, Range};
         let mut snap = Snapshot {
-            position: Some(Position { line: 4, character: 0 }),
+            position: Some(Position {
+                line: 4,
+                character: 0,
+            }),
             ..Snapshot::default()
         };
         assert!(!focus_is_elaborating(&snap));
         snap.progress = vec![Range {
-            start: Position { line: 2, character: 0 },
-            end: Position { line: 6, character: 0 },
+            start: Position {
+                line: 2,
+                character: 0,
+            },
+            end: Position {
+                line: 6,
+                character: 0,
+            },
         }];
         assert!(focus_is_elaborating(&snap));
+    }
+
+    #[test]
+    fn outer_lean_fence_is_removed_without_touching_incomplete_fences() {
+        assert_eq!(
+            strip_outer_code_fence("```lean\nx : Nat\n⊢ x = x\n```"),
+            "x : Nat\n⊢ x = x"
+        );
+        assert_eq!(strip_outer_code_fence("```\n```"), "");
+        assert_eq!(strip_outer_code_fence("```lean\n⊢ True"), "```lean\n⊢ True");
+    }
+
+    #[test]
+    fn highlighted_goal_preserves_text_and_adds_styles() {
+        let text = highlighted_lean("```lean\nexample (x : Nat) : x = 1 := by rfl\n```");
+        let rendered = text
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect::<String>();
+        assert_eq!(rendered, "example (x : Nat) : x = 1 := by rfl");
+        assert!(
+            text.lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.style != Style::default()),
+            "Lean captures should produce colored spans"
+        );
     }
 }
 
 fn render_expected(frame: &mut ratatui::Frame, area: Rect, snap: &Snapshot) {
-    let body = snap.term_goal.clone().unwrap_or_else(|| "—".to_string());
+    let body = snap
+        .term_goal
+        .as_deref()
+        .map(highlighted_lean)
+        .unwrap_or_else(|| plain_text("—"));
     frame.render_widget(
         Paragraph::new(body)
-            .block(Block::default().borders(Borders::ALL).title(" Expected type "))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Expected type "),
+            )
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -372,11 +629,18 @@ fn render_diagnostics(frame: &mut ratatui::Frame, area: Rect, snap: &Snapshot) {
         .and_then(|doc| snap.diagnostics.get(&doc.uri));
     let lines: Vec<Line> = match diags {
         Some(ds) if !ds.is_empty() => ds.iter().map(diagnostic_line).collect(),
-        _ => vec![Line::from(Span::styled("no diagnostics", Style::default().fg(Color::DarkGray)))],
+        _ => vec![Line::from(Span::styled(
+            "no diagnostics",
+            Style::default().fg(Color::DarkGray),
+        ))],
     };
     frame.render_widget(
         Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title(" Diagnostics "))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Diagnostics "),
+            )
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -390,9 +654,16 @@ fn diagnostic_line(d: &Diagnostic) -> Line<'static> {
         Severity::Hint => ("H", Color::Gray),
     };
     Line::from(vec![
-        Span::styled(format!("{tag} "), Style::default().fg(color).add_modifier(Modifier::BOLD)),
         Span::styled(
-            format!("{}:{} ", d.range.start.line + 1, d.range.start.character + 1),
+            format!("{tag} "),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(
+                "{}:{} ",
+                d.range.start.line + 1,
+                d.range.start.character + 1
+            ),
             Style::default().fg(Color::DarkGray),
         ),
         Span::raw(d.message.replace('\n', " ")),
