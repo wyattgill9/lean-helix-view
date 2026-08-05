@@ -24,11 +24,8 @@ use crate::state::StateHandle;
 /// Bind `path` and accept viewer connections forever, one publisher task each.
 /// Removes the socket file on exit (when this future is dropped or errors).
 pub async fn serve(path: PathBuf, state: StateHandle) -> io::Result<()> {
-    let listener = match reclaim_and_bind(&path).await? {
-        Some(listener) => listener,
-        None => return Ok(()), // a live proxy already serves this workspace
-    };
-    let _cleanup = SocketCleanup(path.clone());
+    let listener = reclaim_and_bind(&path)?;
+    let _cleanup = SocketCleanup::of(&path);
     tracing::info!(path = %path.display(), "viewer socket listening");
 
     loop {
@@ -59,41 +56,57 @@ async fn publish_to(mut stream: UnixStream, state: StateHandle) -> io::Result<()
     Ok(())
 }
 
-/// Bind the socket, reclaiming a *stale* file left by a crashed proxy. If the
-/// path is held by a **live** server (another proxy for this workspace), don't
-/// clobber it — return `None` so this instance simply runs without a viewer
-/// socket. Other bind errors propagate.
-async fn reclaim_and_bind(path: &Path) -> io::Result<Option<UnixListener>> {
+/// Bind the socket, taking over whatever is at the path — a stale file from a
+/// crashed proxy *or* a live listener from an older session for this workspace.
+///
+/// Newest-proxy-wins is the point: the Helix you just started is the one you're
+/// looking at. Deferring to the incumbent instead left a second session silently
+/// invisible — the viewer kept showing the older session's goals forever, with
+/// only a log line to explain it. The previous owner's [`SocketCleanup`] is
+/// inode-guarded, so it will not delete the socket we bind here.
+fn reclaim_and_bind(path: &Path) -> io::Result<UnixListener> {
     if let Some(parent) = path.parent() {
-        let _ = tokio::fs::create_dir_all(parent).await;
+        let _ = std::fs::create_dir_all(parent);
     }
     match UnixListener::bind(path) {
-        Ok(listener) => Ok(Some(listener)),
+        Ok(listener) => Ok(listener),
         Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
-            // Probe: a live server accepts a connection; a stale file refuses.
-            if UnixStream::connect(path).await.is_ok() {
-                tracing::warn!(
-                    path = %path.display(),
-                    "another proxy already serves this workspace; viewer socket not bound here"
-                );
-                Ok(None)
-            } else {
-                tracing::info!(path = %path.display(), "reclaiming stale socket");
-                let _ = std::fs::remove_file(path);
-                Ok(Some(UnixListener::bind(path)?))
-            }
+            tracing::info!(path = %path.display(), "taking over the workspace viewer socket");
+            let _ = std::fs::remove_file(path);
+            UnixListener::bind(path)
         }
         Err(e) => Err(e),
     }
 }
 
-/// Removes the socket file when the server task is dropped or returns.
-struct SocketCleanup(PathBuf);
+/// Removes the socket file when the server task is dropped or returns — but
+/// only while it is still *ours*. A newer proxy that took the path over has
+/// replaced the inode, and unlinking that would leave it serving nothing.
+struct SocketCleanup {
+    path: PathBuf,
+    inode: Option<u64>,
+}
+
+impl SocketCleanup {
+    fn of(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            inode: inode_of(path),
+        }
+    }
+}
 
 impl Drop for SocketCleanup {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        if inode_of(&self.path) == self.inode {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
+}
+
+fn inode_of(path: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| m.ino())
 }
 
 #[cfg(test)]
@@ -120,6 +133,19 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         panic!("could not connect to {}", path.display());
+    }
+
+    /// Connect until the socket's owner is the proxy publishing `goal` — the
+    /// takeover is a bind on another task, so it is not instantaneous.
+    async fn connect_until_goal(path: &Path, goal: &str) {
+        for _ in 0..200 {
+            let mut reader = BufReader::new(connect_retry(path).await);
+            if read_snapshot(&mut reader).await.goals == vec![goal.to_string()] {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("socket never served {goal}");
     }
 
     async fn read_snapshot<R: AsyncBufRead + Unpin>(reader: &mut R) -> Snapshot {
@@ -236,19 +262,35 @@ mod tests {
     async fn stale_socket_file_is_reclaimed() {
         let path = unique_socket();
         std::fs::write(&path, b"leftover").unwrap(); // simulate a crashed proxy's file
-        let bound = reclaim_and_bind(&path).await.unwrap();
-        assert!(bound.is_some(), "stale file must be reclaimed, not error out");
+        let bound = reclaim_and_bind(&path).expect("stale file must be reclaimed");
         drop(bound);
         let _ = std::fs::remove_file(&path);
     }
 
-    /// A *live* server at the path is not clobbered.
+    /// A second proxy for the workspace takes the socket over, and the first
+    /// one's cleanup does not then unlink the successor's socket.
     #[tokio::test]
-    async fn live_socket_is_not_clobbered() {
+    async fn newest_proxy_takes_over_and_predecessor_cleanup_spares_it() {
         let path = unique_socket();
-        let _live = reclaim_and_bind(&path).await.unwrap().expect("first bind");
-        let second = reclaim_and_bind(&path).await.unwrap();
-        assert!(second.is_none(), "must not clobber a live server");
+        let state_old = StateHandle::new();
+        state_old.update(|s| s.goals = vec!["old".into()]);
+        let old = tokio::spawn(serve(path.clone(), state_old));
+        let _ = connect_retry(&path).await; // the old proxy is live and serving
+
+        let state_new = StateHandle::new();
+        state_new.update(|s| s.goals = vec!["new".into()]);
+        let new = tokio::spawn(serve(path.clone(), state_new));
+
+        // Viewers connecting now reach the newest session.
+        connect_until_goal(&path, "new").await;
+
+        // The displaced proxy exiting must leave the live socket in place.
+        old.abort();
+        let _ = old.await;
+        let mut reader = BufReader::new(connect_retry(&path).await);
+        assert_eq!(read_snapshot(&mut reader).await.goals, vec!["new".to_string()]);
+
+        new.abort();
         let _ = std::fs::remove_file(&path);
     }
 
