@@ -297,9 +297,11 @@ fn render_goals(
         }
     } else if snap.goals.is_empty() {
         ("no goals — proof complete here".to_string(), false)
-    } else if let Some(rendered) = &snap.rendered {
-        (rendered.clone(), true)
     } else {
+        // Not `rendered`: that is Markdown with *one fence per goal*, and only
+        // the outermost pair can be stripped — a multi-goal focus leaked the
+        // interior ```/--- lines into the pane. `goals` is the same text with
+        // no fences at all.
         (snap.goals.join("\n\n"), true)
     };
     let body = if is_lean {
