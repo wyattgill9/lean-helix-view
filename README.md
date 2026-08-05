@@ -1,6 +1,7 @@
 # lean-helix-view
 
-<img width="1470" height="892" alt="lean-tui-view" src="https://github.com/user-attachments/assets/d83b813d-d8ed-4cdd-8e31-cbce5276e4cb" />
+<img width="1512" height="982" alt="Screenshot 2026-08-04 at 6 32 09 PM" src="https://github.com/user-attachments/assets/ee73e70a-37aa-40e3-bc45-262b04b32820" />
+
 
 A terminal-native Lean 4 infoview for [Helix](https://helix-editor.com), built
 **without modifying Helix or Lean**. It shows live goal / expected-type /
